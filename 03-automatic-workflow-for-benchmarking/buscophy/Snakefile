@@ -1,0 +1,440 @@
+#### SNAKEFILE ####
+
+import pandas as pd 
+import os
+from os import listdir 
+from os.path import isfile, join
+import numpy as np
+
+configfile: "config.yaml"
+
+input_dir=config["input_dir"]
+busco_lineages=config["lineage"]
+busco_args=config["busco_args"]
+workflow_folder = os.path.dirname(os.path.abspath(workflow.snakefile))
+
+sys.path.append(os.path.join(workflow_folder, "scripts"))
+
+print('workflow directory can be found here: {}'.format(workflow_folder))
+
+FILES=glob_wildcards(os.path.join(input_dir , "{species}.{ext, (fa|fas)}"))
+
+FILES=glob_wildcards(os.path.join(input_dir , "{species}.fas"))
+localrules: all
+
+rule all:
+    input:
+        "results/phylo/overview_abspres.csv", # make sure script is in environment
+        "results/busco/summary/busco_figure.png",
+        "results/phylo/busco_phylo.treefile",
+        "results/phylo/busco_phylo_nt.treefile"
+
+### I would suggest adding a rule here to convert all assemblies into upper-case letters. This will remove issues downstream with nt/aa differences
+
+rule busco_download:
+    output:
+        sets="results/busco/lineages/{lineage}/info/species.info"
+    params:
+        dwnld="results/busco"
+    log:
+        "results/logs/busco/download_{lineage}.log"
+    conda:
+        "envs/busco_6.yml"
+    container:
+        "docker://ezlabgva/busco:v6.0.0_cv1"
+    shell:
+        """
+        ( [ -d {params.dwnld} ] || mkdir -p {params.dwnld} )
+        busco --download_path {params.dwnld} --download {wildcards.lineage} &> {log}
+        """
+
+rule busco_run:
+    input:
+        assembly=os.path.join(input_dir , "{species}.fas"),
+        sets="results/busco/lineages/{lineage}/info/species.info"
+    params:
+        mode="genome",
+        busco_out_dir="results/busco/{species}",
+        lineages_dir="results/busco/lineages",
+        busco_args=busco_args
+    output:
+        busco_summary="results/busco/{species}/short_summary.specific.{lineage}.{species}.json",
+        busco_summary_txt="results/busco/{species}/short_summary.specific.{lineage}.{species}.txt",
+        busco_table="results/busco/{species}/run_{lineage}/full_table.tsv"
+    threads:
+        config["max_threads"]
+    log:
+        "results/logs/busco/{species}.{lineage}.busco.log"
+    benchmark:
+        "results/benchmark/busco/{species}.{lineage}.txt"
+    conda:
+        "envs/busco_6.yml"
+    container:
+        "docker://ezlabgva/busco:v6.0.0_cv1"
+    shell:
+        """
+        busco -m {params.mode} -i {input.assembly} -o {params.busco_out_dir} {params.busco_args} --metaeuk --quiet \
+            -l {params.lineages_dir}/{wildcards.lineage} -c {threads} -f --offline &> {log}
+        """
+
+rule busco_summary:
+    input:
+        expand("results/busco/{species}/short_summary.specific.{lineage}.{species}.json", 
+            lineage=busco_lineages, 
+            species=FILES.species 
+            )
+    output:
+        "results/busco/summary/busco_figure.png"
+    params:
+        dir="results/busco/summary/"
+    threads: 1
+    conda:
+        "envs/busco_6.yml"
+    container:
+        "docker://ezlabgva/busco:v6.0.0_cv1"
+    shell:
+        """
+        for file in {input}; do cp $file {params.dir}; done
+        busco --plot {params.dir}
+        """
+
+#################
+## Busco Phylo ##
+#################
+
+#Extract the nucleotide sequences from the gff files
+### This whole rule needs a fix. Whatever tool I use, the nt sequences are inconsistent with the aa sequences. There are issues with missing stop codons at the ends, retained "N"s in the sequences, etc. I will have to look and see how the nt sequenes were extracted in BUSCO v5
+rule get_nt:
+    input:
+        assembly=os.path.join(input_dir , "{species}.fas"),
+        results="results/busco/{species}/run_{lineage}/full_table.tsv"
+    output:
+        touch("results/phylo/{species}.{lineage}.nt_collection.log")
+    params:
+        phylo_dir="results/phylo/busco_sequences",
+        fragmented="yes" if config["fragmented"]=="yes" else [],
+    threads: 1
+    conda:
+        "envs/gffread.yaml"
+    container:
+        "docker://dceoy/gffread:latest"
+    shell:
+        """
+
+[ ! -d {params.phylo_dir} ] && mkdir -p {params.phylo_dir}
+
+# for fragmented genes
+FRAG={params.fragmented}
+if [ -n "$FRAG" ] ; then
+    for file in results/busco/{wildcards.species}/run_{wildcards.lineage}/busco_sequences/fragmented_busco_sequences/*.gff; do
+        base=$(basename "${{file%.gff}}")
+        gffread -W -x {params.phylo_dir}/{wildcards.species}_${{base}}.fna -g {input.assembly} "$file"
+        sed -i 's/^>/>{wildcards.species}|/g' {params.phylo_dir}/{wildcards.species}_${{base}}.fna
+    done
+fi
+
+# for complete busco genes - run in miniprot mode
+#for file in results/busco/{wildcards.species}/run_{wildcards.lineage}/busco_sequences/single_copy_busco_sequences/*.gff; do
+#    base=$(basename "${{file%.gff}}")
+#    gffread -W -x {params.phylo_dir}/{wildcards.species}_${{base}}.fna -g {input.assembly} "$file"
+#    sed -i 's/^>/>{wildcards.species}|/g' {params.phylo_dir}/{wildcards.species}_${{base}}.fna
+#done
+for file in results/busco/{wildcards.species}/run_{wildcards.lineage}/busco_sequences/single_copy_busco_sequences/*.fna; do
+    # copy nt files 
+    cp ${{file}} {params.phylo_dir}/{wildcards.species}_$(basename ${{file}})
+    sed -i 's/^>/>{wildcards.species}|/g' {params.phylo_dir}/{wildcards.species}_$(basename ${{file}})
+done
+"""
+
+#Get the amino acid sequences derived for each gene
+rule get_aa:
+    input:
+        results="results/busco/{species}/run_{lineage}/full_table.tsv"
+    output:
+        touch("results/phylo/{species}.{lineage}_collection.log")
+    params:
+        phylo_dir="results/phylo/busco_sequences",
+        fragmented="yes" if config["fragmented"]== "yes" else [],
+    threads: 1
+    shell:
+        """
+[ ! -d {params.phylo_dir} ] && mkdir -p {params.phylo_dir}
+
+# for fragmented genes
+FRAG={params.fragmented}
+if [ -n "$FRAG" ] ; then
+    for file in results/busco/{wildcards.species}/run_{wildcards.lineage}/busco_sequences/fragmented_busco_sequences/*.faa; do
+        # copy aminoacids
+    	cp ${{file}} {params.phylo_dir}/{wildcards.species}_$(basename ${{file}})
+        sed -i 's/^>/>{wildcards.species}|/g' {params.phylo_dir}/{wildcards.species}_$(basename ${{file}})
+    done
+fi
+
+# for complete busco genes
+for file in results/busco/{wildcards.species}/run_{wildcards.lineage}/busco_sequences/single_copy_busco_sequences/*.faa; do
+    # copy aminoacids
+    cp ${{file}} {params.phylo_dir}/{wildcards.species}_$(basename ${{file}})
+    sed -i 's/^>/>{wildcards.species}|/g' {params.phylo_dir}/{wildcards.species}_$(basename ${{file}})
+done
+
+"""
+
+#### here we added minimum number of busco genes per sample... 
+rule filter_busco:
+    input:
+        logs=expand("results/phylo/{species}.{lineage}_collection.log", lineage=busco_lineages, species=FILES.species ),
+        logs_nt=expand("results/phylo/{species}.{lineage}.nt_collection.log", lineage=busco_lineages, species=FILES.species ),
+        tables=expand("results/busco/{species}/run_{lineage}/full_table.tsv",  species=FILES.species, lineage=busco_lineages  )
+    output:
+        complete="results/phylo/complete_busco_ids.txt",
+        count_compl="results/phylo/complete_busco_ids_counts.txt",
+        final="results/phylo/final_busco_ids.txt"
+    params:
+        min_tax=config["min_spec"],
+        min_genes=config["min_genes"],
+        fragmented="yes" if config["fragmented"]== "yes" else [],
+    threads: 1
+    shell:
+        """
+FRAG={params.fragmented}
+
+for file in {input.tables}; do
+    if [ -n "$FRAG" ] ; then
+        number_of_buscogenes=$(grep -v "^#" ${{file}} | awk '$2=="Complete" || $2=="Fragmented" {{print $1}}' | wc -l)
+        if [ "$number_of_buscogenes" -gt "{params.min_genes}" ]; then
+    
+            grep -v "^#" ${{file}} | awk '$2=="Complete" || $2=="Fragmented" {{print $1}}' >> {output.complete}
+        else
+            echo "sample ${{file}} did not have the minimum number of {params.min_genes} busco genes and is not further processed..." 
+        fi
+    else
+        number_of_buscogenes=$(grep -v "^#" ${{file}} | awk '$2=="Complete" {{print $1}}' | wc -l)
+
+        if [ "$number_of_buscogenes" -gt "{params.min_genes}" ]; then
+    
+            grep -v "^#" ${{file}} | awk '$2=="Complete" {{print $1}}' >> {output.complete}
+        else
+            echo "sample ${{file}} did not have the minimum number of {params.min_genes} busco genes and is not further processed..." 
+        fi
+        
+    fi
+done
+
+#filter out the complete BUSCOs that are only present less than 3 genomes, we can use uniq and awk commands
+
+sort {output.complete} | uniq -c | sed 's/^ *//' > {output.count_compl}
+awk '$1 >= {params.min_tax} {{print $2}}' {output.count_compl} > {output.final}
+
+        """
+#awk '$NF > 2 {{print $2}}' {output.count_compl} > {output.final}
+
+checkpoint collect_busco:
+    input:
+        "results/phylo/final_busco_ids.txt"
+    output:
+        directory("results/phylo/busco_aa_collection"),
+        directory("results/phylo/busco_nt_collection")
+    params:
+        dir_aa="results/phylo/busco_aa_collection",
+        dir_nt="results/phylo/busco_nt_collection",
+        phylo_dir="results/phylo/busco_sequences"
+    threads: 1
+    shell:
+        """
+
+[ ! -d {params.dir_aa} ] && mkdir -p {params.dir_aa}
+[ ! -d {params.dir_nt} ] && mkdir -p {params.dir_nt}
+
+while read line; do
+
+    cat {params.phylo_dir}/*_${{line}}.faa | cut -d'|' -f1  >> {params.dir_aa}/${{line}}_aa.fasta;
+    cat {params.phylo_dir}/*_${{line}}.fna | cut -d'|' -f1  >> {params.dir_nt}/${{line}}_nt.fasta;
+
+done<{input}
+"""
+
+
+rule busco_mafft:
+    input:
+        "results/phylo/busco_aa_collection/{busco_EOG}_aa.fasta"
+    output:
+        "results/phylo/busco_aa_alignments/{busco_EOG}_aa.fasta"
+    threads: 1
+    log:
+        "results/logs/phylo/mafft/{busco_EOG}.log"
+    conda:
+        "envs/mafft.yaml"
+    container:
+        "docker://pegi3s/mafft:7.505"
+    shell:
+        """
+( mafft-linsi --thread {threads} {input} > {output} )&>{log}
+"""
+
+rule busco_mafftnt:
+    input:
+        nt_seq="results/phylo/busco_nt_collection/{busco_EOG}_nt.fasta"
+    output:
+        nt_alignment="results/phylo/busco_nt_alignments/{busco_EOG}_nt.fasta"
+    threads: 1
+    log:
+        "results/logs/phylo/mafft/{busco_EOG}.nt.log"
+    conda:
+        "envs/mafft.yaml"
+    container:
+        "docker://pegi3s/mafft:7.505"
+    shell:
+        """
+( mafft-linsi --thread {threads} {input.nt_seq} > {output.nt_alignment} )&>{log}
+        """
+
+
+rule busco_trim:
+    input:
+        "results/phylo/busco_aa_alignments/{busco_EOG}_aa.fasta"
+    output:
+        "results/phylo/busco_aa_alignments_trim/{busco_EOG}_aa.fasta"
+    threads: 1
+    conda:
+        "envs/trimal.yaml"
+    container:
+        "docker://reslp/trimal:1.4.1"
+    shell:
+        """
+trimal -in {input} -out {output}
+"""
+
+rule busco_trim_nt:
+    input:
+        "results/phylo/busco_nt_alignments/{busco_EOG}_nt.fasta"
+    output:
+        "results/phylo/busco_nt_alignments_trim/{busco_EOG}_nt.fasta"
+    threads: 1
+    conda:
+        "envs/trimal.yaml"
+    container:
+        "docker://reslp/trimal:1.4.1"
+    shell:
+        """
+trimal -in {input} -out {output}
+"""
+
+def aggregate_EOGs_aa(wildcards):
+    checkpoint_output = checkpoints.collect_busco.get(**wildcards).output[0]
+    return expand("results/phylo/busco_aa_alignments_trim/{busco_EOG}_aa.fasta",
+           busco_EOG=glob_wildcards(os.path.join(checkpoint_output, "{busco_EOG}_aa.fasta",)).busco_EOG)
+
+
+rule busco_supermatrix:
+    input:
+        aggregate_EOGs_aa 
+    output:
+        matrix="results/phylo/supermatrix_aa.fasta",
+        partitions="results/phylo/partitions_aa.txt"
+    threads: 1
+    log:
+        "results/logs/phylo/supermatrix_aa.log"
+    conda:
+        "envs/amas.yaml"
+    container:
+        "https://depot.galaxyproject.org/singularity/amas%3A1.0--pyh864c0ab_0"
+    shell:
+        """
+( AMAS.py concat -f fasta -d aa --concat-out {output.matrix} --concat-part {output.partitions} -i {input}  ) &> {log}
+"""
+
+rule busco_iqtree:
+    input:
+        sequence="results/phylo/supermatrix_aa.fasta",      
+    output:
+        "results/phylo/busco_phylo.treefile"
+    threads: config['max_threads'] 
+    params:
+        out_prefix="results/phylo/busco_phylo",
+        model="JTT" # might need to do real model testing... 
+    conda:
+        "envs/iqtree.yaml"
+    container:
+        "https://depot.galaxyproject.org/singularity/iqtree%3A3.0.1--h503566f_0"
+    log:
+        "results/logs/phylo/iqtree.log"
+    shell:
+        """
+( iqtree -s {input.sequence} --prefix {params.out_prefix} -T AUTO --threads-max {threads} -m {params.model} -msub nuclear -B 1000 -alrt 1000 ) &> {log}
+
+
+        """
+# -m {params.model}
+
+rule overview:
+    input:
+        "results/phylo/supermatrix_aa.fasta" 
+    output:
+        table="results/phylo/overview_abspres.csv"
+    params:
+        in_dir="results/phylo/busco_aa_alignments_trim"
+    conda:
+        "envs/bio.yaml"
+    container:
+        "docker://biopython/biopython:latest"
+    log:
+        "results/logs/phylo/overview.log"
+    shell:
+        """
+python3 ./scripts/final_overview.py {params.in_dir} {output.table}
+"""
+# we can also try script function!
+
+def aggregate_EOGs_nt(wildcards):
+    checkpoint_output = checkpoints.collect_busco.get(**wildcards).output[1]
+    return expand("results/phylo/busco_nt_alignments_trim/{busco_EOG}_nt.fasta",
+           busco_EOG=glob_wildcards(os.path.join(checkpoint_output, "{busco_EOG}_nt.fasta",)).busco_EOG)
+
+rule busco_supermatrix_nt:
+    input:
+        aggregate_EOGs_nt 
+    output:
+        matrix="results/phylo/supermatrix_nt.fasta",
+        partitions="results/phylo/partitions_nt.txt"
+    threads: 1
+    log:
+        "results/logs/phylo/supermatrix_nt.log"
+    conda:
+        "envs/amas.yaml"
+    container:
+        "https://depot.galaxyproject.org/singularity/amas%3A1.0--pyh864c0ab_0"
+    shell:
+        """
+( AMAS.py concat -f fasta -d dna --concat-out {output.matrix} --concat-part {output.partitions} -i {input}  ) &> {log}
+"""
+
+
+rule busco_iqtree_nt:
+    input:
+        sequence="results/phylo/supermatrix_nt.fasta",      
+    output:
+        "results/phylo/busco_phylo_nt.treefile"
+    threads: config['max_threads']
+    params:
+        out_prefix="results/phylo/busco_phylo_nt",
+        model="GTR" # might need to do real model testing... 
+    conda:
+        "envs/iqtree.yaml"
+    container:
+        "https://depot.galaxyproject.org/singularity/iqtree%3A3.0.1--h503566f_0"
+    log:
+        "results/logs/phylo/iqtree_nt.log"
+    shell:
+        """
+(iqtree -s {input.sequence} --prefix {params.out_prefix} -T AUTO --threads-max {threads} -m {params.model} -msub nuclear -B 1000 -alrt 1000 ) &> {log}
+        """
+
+onsuccess:
+    print("Workflow finished successfully!\nThank you for using buscophy.")
+#    print("Generating report...")
+#    shell("snakemake --report report.zip")
+    print("Done!")
+
+onerror:
+    print("An error occurred!")
+    print("See the log file for more details ...")
