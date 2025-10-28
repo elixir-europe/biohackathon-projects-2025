@@ -1,0 +1,7 @@
+input_dir: 'species'
+lineage: 'viridiplantae_odb12'
+fragmented: 'no'
+min_spec: 4
+min_genes: 3
+max_threads: 40
+busco_args: "--skip_bbtools" #default: --metaeuk to get both aa and nt files. Would also like to include --augustus
