@@ -11,6 +11,7 @@ All rules and base pipeline is taken from https://gitlab.leibniz-lib.de/smartin/
 
 * Change the workflow so that individual gene trees are made instead of a tree based on one supermatrix (could be an option)
 * Add multi-copy genes and implement a procedure for choosing the paralogs
+  - Scripts are now in the `scripts` folder detailing a method for paralog selection based on gene trees
 * Add the option to run busco with the `--augustus` argument. There needs to be some change with the augustus config in the singularity image
 * Modularise the pipeline to help tidy it up and allow for plug-and-play configuration
 * Tidy up the conda envs - at the moment these have no version numbers. They should be consistent with the singularity/docker images.
